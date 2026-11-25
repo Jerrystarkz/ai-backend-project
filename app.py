@@ -4,9 +4,9 @@ import requests
 
 API_URL = "http://127.0.0.1:8000"
 
-st.set_page_config(page_title="Local RAG Assistant", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="Jerrystarkz RAG  ", page_icon="🤖", layout="wide")
 
-st.title("📂 Local RAG Assistant (FastAPI + Ollama)")
+st.title("📂 Jerrystarkz RAG   (FastAPI + Ollama)")
 st.sidebar.header("Document Management")
 
 # --- 1. File Upload Section ---
