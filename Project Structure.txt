@@ -1,0 +1,147 @@
+
+
+Technical Architecture & Operations Reference
+Local RAG Assistant — System Documentation
+FastAPI, PostgreSQL (JSONB & Array Embeddings), Ollama (llama3.2), and Streamlit
+
+1. System Overview
+The Local RAG Assistant is a full-stack local Retrieval-Augmented Generation (RAG)
+ and tool-calling agent application built with FastAPI, PostgreSQL, Ollama (llama3.2),
+  and Streamlit. It runs entirely on local infrastructure, serving the FastAPI backend
+   on port 8000 and the Streamlit user interface on port 8501.
+
+The platform supports PDF and plain-text ingestion, boundary-aware overlapping text 
+chunking with automated page tracking, vector similarity search, local Python tool 
+invocation, progressive token streaming, and session-persistent chat history stored in
+ PostgreSQL.
+
+2. System Architecture & Request Lifecycle
++-------------------------------------------------------------------+
+|                        Streamlit Frontend                         |
+|                    (http://127.0.0.1:8501)                        |
+|  - Sidebar: File uploader (.txt, .pdf), Ingest trigger, Session ID|
+|  - Main Chat: History replay, st.write_stream() live token output |
++---------------------------------+---------------------------------+
+                                  | HTTP (requests)
+                                  v
++-------------------------------------------------------------------+
+|                        FastAPI Backend                            |
+|                    (http://127.0.0.1:8000)                        |
+|  Routers (/documents):                                            |
+|   - POST /upload/         (extract, chunk, embed, store metadata) |
+|   - POST /agent/          (non-streaming agent + tool execution)  |
+|   - POST /agent/stream/   (StreamingResponse + DB persistence)    |
+|   - GET  /history/{id}    (session message history retrieval)     |
+|   - POST /search/         (cosine similarity chunk retrieval)     |
+|   - POST /ask/            (history-aware grounded RAG Q&A)        |
++---------+---------------------------+-----------------------------+
+          | SQLAlchemy (SessionLocal) | HTTP (requests / httpx)
+          v                           v
++---------------------+     +---------------------------------------+
+| PostgreSQL Database |     | Local Ollama Runtime                  |
+|  - documents        |     |  - /api/chat (llama3.2, tools/stream) |
+|  - document_chunks  |     |  - Embeddings endpoint (via service)  |
+|  - chat_history     |     +---------------------------------------+
++---------------------+                                             
+Local RAG Assistant — System Documentation
+Page 1 of 4
+3. Project Structure & Module Responsibilities
+Module / Path	Architectural Role	Key Responsibilities
+main.py	Application Entrypoint	Instantiates the FastAPI application and mounts
+ API routers including routers.documents.
+config.py	Configuration	Centralizes runtime settings (llm_model, llm_api_url, 
+llm_api_key, environment parameters).
+database.py	Database Engine	Configures SQLAlchemy engine, SessionLocal factory, 
+and declarative Base.
+models.py	ORM Schema	Defines Document, DocumentChunk (with page_number and JSONB 
+chunk_metadata), and ChatMessage.
+schemas.py	Data Contracts	Defines Pydantic request and response schemas
+ (AskRequest, AskResponse, SourceChunk).
+crud.py	Data Access Layer	Persists documents and chunks with metadata, saves chat turns,
+ and queries session history.
+utils.py	Similarity Utilities	Implements cosine_similarity to rank chunk embeddings against
+ query vectors.
+routers/documents.py
+	REST & Stream API	Exposes /upload/, /agent/, /agent/stream/, /history/{session_id},
+   /search/, and /ask/.
+services/embedding.py	Embedding Service	Generates dense vector embeddings (generate_embedding)
+ for chunks and search queries.
+services/tools.py	Agent Toolset	Implements get_document_count, calculate_expression, 
+search_document_content, and AVAILABLE_TOOLS.
+services/llm.py	LLM Orchestration	Defines TOOLS_SCHEMA, generate_agent_response,
+ stream_agent_response, and generate_grounded_answer.
+app.py	Streamlit Frontend	Renders document upload controls, session management,
+ history replay, and st.write_stream output.
+4. Database Schema (models.py)
+Table Name	Column	SQLAlchemy Type	Purpose & Constraints
+documents	id, filename, upload_date	Integer, String, DateTime	Parent document record; 
+cascades deletes to child DocumentChunk rows.
+document_chunks	id, document_id, chunk_index	Integer, ForeignKey, Integer	Primary key,
+ parent reference (documents.id), and sequential chunk position.
+Local RAG Assistant — System Documentation
+Page 2 of 4
+Table Name	Column	SQLAlchemy Type	Purpose & Constraints
+document_chunks	page_number	Integer (Nullable)	1-based PDF page number extracted during
+ ingestion; None for plain-text files.
+document_chunks	chunk_metadata	JSONB (Nullable)	Stores filename, source_type, page_number,
+ page_chunk_index, chunk_index, char_length.
+document_chunks	content, embedding	Text, ARRAY(Float)	Header-enriched text segment and dense
+ vector stored as a PostgreSQL float array.
+chat_history	id, session_id, role, content, timestamp	Integer, String, String, Text,
+ DateTime	Stores user and assistant turns indexed by session_id and ordered chronologically.
+5. Core Pipelines & Operational Workflows
+5.1 Document Ingestion & Boundary-Aware Chunking (POST /documents/upload/)
+Reads raw bytes from the uploaded .pdf or .txt file via FastAPI UploadFile.
+For PDF documents, extracts text page-by-page (1..N via PdfReader); for text files,
+ decodes UTF-8 strings.
+Splits text using chunk_text_with_overlap(chunk_size=800, overlap=150), normalizing whitespace,
+ snapping split boundaries to sentence or word breaks in the second half of the window,
+  and retaining 150 characters of overlap across consecutive chunks.
+Prefixes each chunk with [File: ... | Page: ... | Chunk: ...], computes an embedding
+ via generate_embedding, and stores page_number and chunk_metadata through crud.create_document_with_chunks.
+5.2 Agentic Tool Execution & Token Streaming (POST /documents/agent/stream/)
+Persists the incoming user message to chat_history under the active session_id.
+Queries Ollama (llama3.2) with TOOLS_SCHEMA (stream=False) to inspect whether a
+ tool call is required.
+When requested, executes the corresponding local Python function: get_document_count(db),
+ calculate_expression(expression), or search_document_content(keyword, db).
+Appends the tool output to the message list and streams the final answer (stream=True)
+ through FastAPI StreamingResponse (text/plain; charset=utf-8).
+Uses a dedicated SessionLocal() inside the stream generator to accumulate all chunks
+ and save the complete assistant response (with an empty-output fallback guard) upon stream completion.
+Local RAG Assistant — System Documentation
+Page 3 of 4
+5.3 Semantic Vector Search & Grounded Q&A (/search/ & /ask/)
+Both endpoints embed the incoming query with generate_embedding and rank stored chunks
+ by cosine_similarity. The /ask/ endpoint additionally retrieves recent session turns via get_session_history,
+  constructs numbered context blocks, generates a grounded answer via generate_grounded_answer,
+   saves both conversation turns, and returns source snippets and similarity scores.
+
+6. Chunk Size Distribution Histogram
+The histogram below illustrates the expected character-length distribution produced by
+ chunk_text_with_overlap(chunk_size=800, overlap=150) across multi-page documents. 
+ Boundary snapping concentrates most chunks inside the 601–800 character window, with 
+ shorter trailing segments at page and document endings.
+
+Character Bucket	Relative Distribution	Structural Cause
+1 – 200 chars	
+Short trailing fragments at page or file boundaries
+201 – 400 chars	
+Short sections or sparse PDF pages
+401 – 600 chars	
+Early sentence-boundary snaps inside the search window
+601 – 800 chars	
+Primary target window (boundary-snapped near 800 chars)
+801 – 1000 chars	
+Slight boundary alignment overshoot past nominal target
+1000+ chars	
+Rare unbroken continuous strings without delimiters
+7. Local Runtime & Operations
+Database Prerequisites: Ensure PostgreSQL is running with tables documents,
+ document_chunks (including page_number INTEGER and chunk_metadata JSONB), 
+ and chat_history, and ensure Ollama is running locally at http://127.0.0.1:11434 with llama3.2 pulled.
+
+Service	Launch Command	Local Endpoint
+FastAPI Backend	uvicorn main:app --reload --host 127.0.0.1 --port 8000	http://127.0.0.1:8000
+Streamlit Frontend	streamlit run app.py	http://127.0.0.1:8501
+Local RAG Assistant — System Documentation
